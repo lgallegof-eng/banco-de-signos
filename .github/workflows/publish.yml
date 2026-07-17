@@ -2,8 +2,8 @@ name: Banco de Signos Daily
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC diario (ajusta si quieres)
-  workflow_dispatch: {}    # Ejecutar manualmente
+    - cron: "0 6 * * *"   # 06:00 UTC diario (ajústalo si quieres)
+  workflow_dispatch: {}    # Permite ejecutarlo manualmente
 
 permissions:
   contents: read
@@ -26,11 +26,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Define el HOME del modelo en una ruta temporal del runner
+      # Define ruta de caché para modelos (SBERT)
       - name: Set Sentence-Transformers cache home
         run: echo "SENTENCE_TRANSFORMERS_HOME=$RUNNER_TEMP/sbert" >> $GITHUB_ENV
 
-      # (Opcional) Cache pip para acelerar instalaciones
+      # Cache pip
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -39,50 +39,49 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
-      # Cache del modelo (usa la variable que acabamos de definir)
+      # Cache del modelo
       - name: Cache Sentence-Transformers
         uses: actions/cache@v4
         with:
           path: ${{ env.SENTENCE_TRANSFORMERS_HOME }}
           key: sbert-${{ runner.os }}-distiluse-base-multilingual-v1
 
-      # Persistimos histórico entre ejecuciones
+      # Restaurar histórico (cache)
       - name: Restore history cache
         uses: actions/cache/restore@v4
         with:
           path: public/data
-          key: history-${{ runner.os }}
+          key: history-v4-${{ runner.os }}
           restore-keys: |
-            history-${{ runner.os }}
+            history-v4-${{ runner.os }}
 
-            - name: Install deps
+      # Instalar dependencias necesarias
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install feedparser numpy sentence-transformers requests beautifulsoup4 lxml
 
+      # Ejecutar el agente
       - name: Run Banco de Signos
         env:
           PUBLISH_DIR: ${{ github.workspace }}/public
           HIST_DIR: ${{ github.workspace }}/public/data
+          # Dominios permitidos para fallback de título/description desde HTML (opcional)
+          ALLOWED_SCRAPE_DOMAINS: "elperiodico.com,lavozdegalicia.es,smoda.elpais.com,codigonuevo.com,reasonwhy.es,controlpublicidad.com,elconfidencial.com,theatlantic.com,nytimes.com,fastcompany.com,highsnobiety.com,ft.com,businessinsider.com,businessinsider.es,bloomberg.com,theguardian.com,reuters.com,theverge.com,wired.com"
         run: python ci_pipeline.py
 
+      # Guardar histórico actualizado
       - name: Save history cache
         uses: actions/cache/save@v4
         with:
           path: public/data
-          key: history-${{ runner.os }}-${{ github.run_id }}
+          key: history-v4-${{ runner.os }}-${{ github.run_id }}
 
+      # Subir artefacto de Pages
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./public
-          
-      - name: Run Banco de Signos
-        env:
-          PUBLISH_DIR: ${{ github.workspace }}/public
-          HIST_DIR: ${{ github.workspace }}/public/data
-          ALLOWED_SCRAPE_DOMAINS: "elperiodico.com,lavozdegalicia.es,smoda.elpais.com,codigonuevo.com,reasonwhy.es,controlpublicidad.com,elconfidencial.com,theatlantic.com,nytimes.com,fastcompany.com,highsnobiety.com,ft.com,businessinsider.com,businessinsider.es,bloomberg.com,theguardian.com"
-        run: python ci_pipeline.py
 
   deploy:
     needs: build
