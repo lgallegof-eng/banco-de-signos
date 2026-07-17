@@ -1,9 +1,9 @@
 # ci_pipeline.py
-# Banco de Signos — Señales débiles: recencia + novedad + micro-clústeres + marcos + opinión
+# Banco de Signos — Señales débiles: recencia + novedad + micro-clústeres + marcos + opinión + aceleración (7 días)
 import os, time, math, datetime as dt, re
 from pathlib import Path
 from email.utils import parsedate_to_datetime
-from collections import Counter, deque, defaultdict
+from collections import Counter, deque
 
 import feedparser
 import numpy as np
@@ -29,19 +29,20 @@ FEEDS = [
     "https://www.businessinsider.com/rss",
     "https://www.businessinsider.es/rss",
     "https://feeds.bloomberg.com/markets/news.rss",
-    # puedes añadir más
 ]
 
-TOP_K_ITEMS = 25            # listado de respaldo (si faltan clústeres)
-HISTORY_DAYS = 21           # ventana histórico para novedad
-MAX_AGE_DAYS = 5            # recencia: últimos 5 días
+# Señales
+TOP_K_ITEMS = 25            # respaldo de piezas si no hay clústeres
+MAX_PER_SOURCE = 4          # límite por fuente en respaldo
+# Ventanas/umbrales
+HISTORY_DAYS = 21           # histórico para novedad
+MAX_AGE_DAYS = 7            # analizamos últimos 7 días
 RECENCY_TAU_HOURS = 96      # semivida recencia
-SIM_THRESHOLD = 0.72        # umbral similitud para micro-clústeres
-CLUSTER_MIN = 2             # tamaño mínimo de clúster
-CLUSTER_MAX = 8             # tamaño máximo de clúster (señales débiles suelen ser micro)
-MAX_PER_SOURCE = 4          # límite por cabecera (variedad)
+SIM_THRESHOLD = 0.72        # similitud mínima para clusterizar
+CLUSTER_MIN = 2             # micro-clúster mínimo
+CLUSTER_MAX = 8             # micro-clúster máximo
 
-# Directorios controlados por el workflow
+# Publicación
 PUBLISH_DIR = Path(os.getenv("PUBLISH_DIR", "public")).resolve()
 HIST_DIR = Path(os.getenv("HIST_DIR", "public/data")).resolve()
 PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,50 +51,24 @@ HIST_DIR.mkdir(parents=True, exist_ok=True)
 HIST_FILE = HIST_DIR / "history.npz"
 MODEL_NAME = "sentence-transformers/distiluse-base-multilingual-cased-v2"
 
-# ------------ Diccionarios de marcos (ES/EN) ------------
+# ------------ Marcos y opinión (diccionarios ES/EN) ------------
 FRAMES = {
-    "economía": [
-        "precio", "precios", "inflación", "coste", "costes", "empleo", "desempleo",
-        "recuperación", "salario", "PIB", "mercado", "inversión", "profits", "growth",
-        "inflation", "cost", "costs", "jobs", "recession", "recovery", "gdp", "market",
-        "investment", "funding", "valuation", "earnings"
-    ],
-    "salud": [
-        "salud", "sanitario", "sanitaria", "epidemia", "pandemia", "hospital", "OMS",
-        "mental", "bienestar", "contagio", "vacuna", "vaccine", "health", "public health",
-        "hospital", "wellbeing", "mental health"
-    ],
-    "sostenibilidad": [
-        "clima", "climático", "emisiones", "CO2", "energía", "renovable", "circular",
-        "sostenible", "biodiversidad", "green", "sustainable", "renewable", "emissions",
-        "net zero", "climate", "carbon"
-    ],
-    "privacidad/tech": [
-        "privacidad", "datos", "algoritmo", "IA", "inteligencia artificial", "modelo",
-        "plataforma", "red social", "app", "tracking", "cookies", "privacy", "data",
-        "algorithm", "ai", "platform", "tracking", "surveillance", "biometrics"
-    ],
-    "justicia_social": [
-        "género", "igualdad", "diversidad", "inclusión", "derechos", "discriminación",
-        "racismo", "LGTBI", "feminismo", "equity", "diversity", "inclusion", "rights",
-        "discrimination", "racism", "gender"
-    ],
-    "geopolítica": [
-        "guerra", "conflicto", "frontera", "sanciones", "OTAN", "UE", "china", "rusia",
-        "eeuu", "diplomacia", "war", "conflict", "border", "sanctions", "nato", "eu",
-        "china", "russia", "us", "geopolitics"
-    ],
-    "consumo/estilo": [
-        "consumo", "tendencia", "moda", "lifestyle", "estilo", "consumidor", "compra",
-        "retail", "cultura", "estética", "trend", "style", "fashion", "consumer",
-        "shopping", "culture"
-    ],
+    "economía": ["precio","precios","inflación","coste","costes","empleo","desempleo","recuperación","salario","pib","mercado","inversión",
+                 "profits","growth","inflation","cost","jobs","recession","recovery","gdp","market","investment","funding","valuation","earnings"],
+    "salud": ["salud","sanitario","sanitaria","epidemia","pandemia","hospital","oms","mental","bienestar","contagio","vacuna",
+              "vaccine","health","public health","wellbeing","mental health"],
+    "sostenibilidad": ["clima","climático","emisiones","co2","energía","renovable","circular","sostenible","biodiversidad",
+                       "green","sustainable","renewable","emissions","net zero","climate","carbon"],
+    "privacidad/tech": ["privacidad","datos","algoritmo","ia","inteligencia artificial","modelo","plataforma","red social","app",
+                        "tracking","cookies","privacy","data","algorithm","ai","platform","surveillance","biometrics"],
+    "justicia_social": ["género","igualdad","diversidad","inclusión","derechos","discriminación","racismo","lgtbi","feminismo",
+                        "equity","diversity","inclusion","rights","discrimination","racism","gender"],
+    "geopolítica": ["guerra","conflicto","frontera","sanciones","otan","ue","china","rusia","eeuu","diplomacia",
+                    "war","conflict","border","sanctions","nato","eu","geopolitics","us"],
+    "consumo/estilo": ["consumo","tendencia","moda","lifestyle","estilo","consumidor","compra","retail","cultura","estética",
+                       "trend","style","fashion","consumer","shopping","culture"],
 }
-
-OPINION_HINTS = [
-    "opinión", "opinion", "análisis", "analysis", "editorial", "tribuna",
-    "columna", "column", "op-ed", "view", "viewpoint", "perspective"
-]
+OPINION_HINTS = ["opinión","opinion","análisis","analysis","editorial","tribuna","columna","column","op-ed","view","viewpoint","perspective"]
 
 STOPWORDS = set("""
 a al algo algunas algunos ante antes así aún aunque cada como con contra cual cuales cuando
@@ -106,7 +81,6 @@ toda todas todo todos tras tú un una unas uno unos ya the a an and or of for to
 is are was were be been being have has had do does did with as at into over after before about
 between more most other some such no nor not only own same so than too very can will just should
 """.split())
-
 TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ0-9]+")
 
 # ------------ Utilidades ------------
@@ -129,8 +103,7 @@ def parse_entry_dt(entry):
     return None
 
 def is_opinion(title, summary):
-    t = (title or "").lower()
-    s = (summary or "").lower()
+    t = (title or "").lower(); s = (summary or "").lower()
     return any(h in t or h in s for h in OPINION_HINTS)
 
 def frame_profile(text):
@@ -139,7 +112,6 @@ def frame_profile(text):
     for f, kws in FRAMES.items():
         c = sum(1 for kw in kws if kw in txt)
         scores[f] = c
-    # normaliza
     total = sum(scores.values()) or 1
     for k in scores:
         scores[k] = scores[k] / total
@@ -166,12 +138,10 @@ def fetch_items(feeds, now_utc):
         source = d.feed.get("title", url)
         for e in d.entries:
             link = (e.get("link") or "").split("?")[0]
-            if not link or link in seen:
-                continue
+            if not link or link in seen: continue
             seen.add(link)
             dpub = parse_entry_dt(e)
-            if not dpub or dpub < cutoff:
-                continue
+            if not dpub or dpub < cutoff: continue
             title = (e.get("title", "") or "").strip() or "(Sin título)"
             summary = (e.get("summary", "") or "").strip()
             items.append({
@@ -193,56 +163,73 @@ def load_history():
 def save_history(E_hist, d_hist):
     np.savez_compressed(HIST_FILE, E=E_hist, d=d_hist)
 
-def build_clusters(E, items, novelty):
-    # E: (n,d) normalizado. Construye grafo por umbral y extrae componentes
+def build_clusters(E, items, novelty, now_utc, frame_global_freq):
+    # Matriz de similitud
     n = E.shape[0]
     S = E @ E.T
     np.fill_diagonal(S, 0.0)
+
+    # Grafo por umbral y componentes conexas
     adj = [[] for _ in range(n)]
     for i in range(n):
-        # umbral de similitud
         js = np.where(S[i] >= SIM_THRESHOLD)[0]
         for j in js:
             adj[i].append(j)
             adj[j].append(i)
+
     visited = [False]*n
-    clusters = []
+    raw_clusters = []
     for i in range(n):
         if visited[i]: continue
         comp = []
         q = deque([i]); visited[i] = True
         while q:
-            u = q.popleft()
-            comp.append(u)
+            u = q.popleft(); comp.append(u)
             for v in adj[u]:
                 if not visited[v]:
-                    visited[v] = True
-                    q.append(v)
+                    visited[v] = True; q.append(v)
         if CLUSTER_MIN <= len(comp) <= CLUSTER_MAX:
-            clusters.append(sorted(comp))
-    # Calcula métricas y etiquetas por clúster
+            raw_clusters.append(sorted(comp))
+
     results = []
-    for comp in clusters:
+    for comp in raw_clusters:
         comp_items = [items[i] for i in comp]
+        comp_texts = [it["title"] + " " + (it["summary"] or "") for it in comp_items]
         comp_nov = float(np.mean([novelty[i] for i in comp]))
         sources = [it["source"] for it in comp_items]
-        uniq_sources = len(set(sources))
-        diversity = uniq_sources / max(1, len(comp))
+        diversity = len(set(sources)) / max(1, len(comp))
         opinions = any(is_opinion(it["title"], it["summary"]) for it in comp_items)
-        opinion_bonus = 0.15 if opinions else 0.0
-        # marcos
+        # Marco dominante y rareza global
         frame_counts = Counter()
         for it in comp_items:
-            topf, _ = frame_profile((it["title"] + " " + it["summary"]))
+            topf, _ = frame_profile(it["title"] + " " + it["summary"])
             if topf: frame_counts[topf] += 1
-        top_frame, top_frame_cnt = (frame_counts.most_common(1)[0] if frame_counts else (None, 0))
-        # términos
-        terms = top_terms([it["title"] + " " + it["summary"] for it in comp_items], k=5)
-        # puntuación compuesta (0..1)
-        # pequeña preferencia por microtamaño (2-6)
+        top_frame, _cnt = (frame_counts.most_common(1)[0] if frame_counts else (None, 0))
+        rarity = 0.0
+        if top_frame and frame_global_freq:
+            rarity = 1.0 - frame_global_freq.get(top_frame, 0.0)
+
+        # Aceleración: últimos 3 días vs 4 anteriores (dentro de los 7 días)
+        ages_d = [max(0, (now_utc.date() - it["published_dt"].date()).days) for it in comp_items]
+        last3 = sum(1 for d in ages_d if d <= 2)
+        prev4 = sum(1 for d in ages_d if 3 <= d <= 6)
+        accel = (last3 + 1) / (prev4 + 1)  # suavizado
+        # Normaliza aceleración a 0..1 (>=2.5 satura)
+        accel_norm = max(0.0, min(1.0, (accel - 1.0) / 1.5))
+
+        # Preferencia por micro-tamaño (2-6)
         size = len(comp)
         size_pref = 1.0 if size <= 6 else 0.8
-        score = 0.5*comp_nov + 0.3*diversity + 0.2*size_pref + opinion_bonus
+
+        # Términos representativos
+        terms = top_terms(comp_texts, k=5)
+
+        # Puntuación compuesta
+        opinion_bonus = 0.05 if opinions else 0.0
+        score = (0.40*comp_nov + 0.20*diversity + 0.10*size_pref +
+                 0.15*accel_norm + 0.15*rarity + opinion_bonus)
+        score = max(0.0, min(1.0, score))
+
         results.append({
             "idxs": comp,
             "size": size,
@@ -250,11 +237,15 @@ def build_clusters(E, items, novelty):
             "diversity": round(diversity, 3),
             "opinion": opinions,
             "top_frame": top_frame,
+            "rarity": round(rarity, 3),
+            "accel": round(accel, 2),
+            "accel_norm": round(accel_norm, 3),
             "terms": terms,
-            "score": round(min(score, 1.0), 3),
+            "score": round(score, 3),
             "sources": sorted(set(sources)),
             "items": comp_items,
         })
+
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
@@ -275,9 +266,9 @@ def build_html(today, clusters, picked_items):
         "ul{margin:6px 0 0 18px}",
         "</style></head><body>",
         f"<h1>Banco de Signos — Señales débiles (últimos {MAX_AGE_DAYS} días)</h1>",
-        "<p>Prioriza micro‑clústeres recientes con alta novedad, diversidad de fuentes, opinión/análisis y marcos poco frecuentes.</p>",
+        "<p>Micro‑clústeres recientes con alta novedad, diversidad de fuentes, opinión/análisis, marcos poco frecuentes y aceleración (3d vs 4d prev).</p>",
     ]
-    # Sección de clústeres
+    # Clústeres
     if clusters:
         for c in clusters:
             cls = "hi" if c["score"] >= 0.6 else ("med" if c["score"] >= 0.4 else "lo")
@@ -288,11 +279,11 @@ def build_html(today, clusters, picked_items):
             bullets.append(f"Tamaño: {c['size']} · Fuentes: {len(c['sources'])} ({', '.join(c['sources'][:5])})")
             bullets.append(f"Novedad media: {c['avg_novelty']:.2f} · Diversidad: {c['diversity']:.2f}")
             if c["top_frame"]:
-                bullets.append(f"Marco dominante: {c['top_frame']}")
+                bullets.append(f"Marco dominante: {c['top_frame']} · Rareza: {c['rarity']:.2f}")
+            bullets.append(f"Aceleración (3d/4d prev): {c['accel']:.2f}")
             if c["opinion"]:
                 bullets.append("Incluye opinión/análisis")
             parts.append("<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>")
-            # muestras
             for it in c["items"]:
                 meta = f"{it['source']} · {it['published_dt'].isoformat(timespec='minutes')}"
                 parts.append(f"<p><a href='{it['url']}' target='_blank' rel='noopener'>{it['title']}</a><br><span class='meta'>{meta}</span></p>")
@@ -300,8 +291,8 @@ def build_html(today, clusters, picked_items):
     else:
         parts.append("<p>No se han detectado micro‑clústeres hoy. Mostramos piezas destacadas por novedad+recencia.</p>")
 
-    # Respaldo: piezas individuales si faltan clústeres
-    if picked_items:
+    # Respaldo: piezas individuales (si no hay clústeres)
+    if picked_items and not clusters:
         parts.append("<h2>Piezas destacadas (novedad × recencia)</h2>")
         for r in picked_items:
             score = r["score"]
@@ -312,16 +303,13 @@ def build_html(today, clusters, picked_items):
             if r.get("summary"):
                 short = r["summary"]; short = (short[:320] + "…") if len(short) > 340 else short
                 parts.append(f"<p>{short}</p>")
-            meta = f"{r['source']} · {r.get('published_iso','')} · novedad {r['novelty']:.2f} · hace {r['age_hours']:.0f}h"
-            if r.get("top_frame"):
-                meta += f" · marco: {r['top_frame']}"
-            if r.get("opinion"):
-                meta += " · opinión/análisis"
+            meta = f"{r['source']} · {r['published_iso']} · novedad {r['novelty']:.2f} · hace {r['age_hours']:.0f}h"
+            if r.get("top_frame"): meta += f" · marco: {r['top_frame']}"
+            if r.get("opinion"): meta += " · opinión/análisis"
             parts.append(f"<div class='meta'>{meta}</div>")
             parts.append("</div>")
 
-    parts.append("<hr><small>RSS públicos. Score de clúster = novedad×diversidad×tamaño (micro) + bonus opinión. "
-                 "Los marcos se estiman con diccionarios ES/EN.</small>")
+    parts.append("<hr><small>RSS públicos. Puntuación de clúster = novedad×diversidad×preferencia por micro + aceleración (3d/4d) + rareza del marco + bonus de opinión.</small>")
     parts.append("</body></html>")
     fn.write_text("\n".join(parts), encoding="utf-8")
     return fn.name
@@ -349,42 +337,49 @@ def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
     today_iso = now_utc.date().isoformat()
 
+    # 1) Ingesta (últimos 7 días)
     items = fetch_items(FEEDS, now_utc)
-    # Genera siempre índice (evita 404)
     if not items:
         build_index()
         print("Sin artículos recientes.")
         return
 
-    # Texto para embeddings
+    # 2) Embeddings de la ventana (título + resumen)
     texts = [(it["title"] + " || " + (it["summary"] or "")[:1000]).strip() for it in items]
-
-    # Modelo multilingüe
     model = SentenceTransformer(MODEL_NAME)
     E_today = model.encode(texts, batch_size=16, normalize_embeddings=True)
     E_today = np.asarray(E_today).astype(np.float32)
 
-    # Cargar histórico y recortar ventana
+    # 3) Novedad vs. histórico
     E_hist, d_hist = load_history()
     cutoff = (now_utc.date() - dt.timedelta(days=HISTORY_DAYS)).toordinal()
     if E_hist is not None and d_hist is not None:
         mask = d_hist >= cutoff
         E_hist, d_hist = E_hist[mask], d_hist[mask]
-
-    # Novedad vs. histórico
     if E_hist is None or E_hist.shape[0] == 0:
         novelty = np.ones(E_today.shape[0], dtype=np.float32)
     else:
         sims = E_today @ E_hist.T
         novelty = 1.0 - np.max(sims, axis=1)
 
-    # Recencia y score individual (respaldo)
+    # 4) Perfil global de marcos (rareza)
+    frame_global_counts = Counter()
+    for it in items:
+        topf, _ = frame_profile(it["title"] + " " + it["summary"])
+        if topf: frame_global_counts[topf] += 1
+    total_frames = sum(frame_global_counts.values()) or 1
+    frame_global_freq = {k: v/total_frames for k,v in frame_global_counts.items()}
+
+    # 5) Micro‑clústeres (7 días) con aceleración
+    clusters = build_clusters(E_today, items, novelty, now_utc, frame_global_freq)
+
+    # 6) Respaldo de piezas (novedad × recencia) si no hubiera clústeres
     picked = []
     for i, it in enumerate(items):
         age_h = max(0.0, (now_utc - it["published_dt"]).total_seconds() / 3600.0)
         recency_w = math.exp(-age_h / float(RECENCY_TAU_HOURS))
         score = float(novelty[i]) * recency_w
-        topf, _ = frame_profile((it["title"] + " " + it["summary"]))
+        topf, _ = frame_profile(it["title"] + " " + it["summary"])
         picked.append({
             **it,
             "published_iso": it["published_dt"].isoformat(timespec="minutes"),
@@ -395,7 +390,6 @@ def main():
             "opinion": is_opinion(it["title"], it["summary"]),
             "url": it["url"],
         })
-    # limitar por fuente para variedad
     picked.sort(key=lambda r: r["score"], reverse=True)
     out_items, seen_per_source = [], {}
     for r in picked:
@@ -406,14 +400,11 @@ def main():
         if len(out_items) >= TOP_K_ITEMS:
             break
 
-    # Micro‑clústeres
-    clusters = build_clusters(E_today, items, novelty)
-
-    # Generar salida
+    # 7) Publicación
     build_html(today_iso, clusters, out_items if not clusters else [])
     build_index()
 
-    # Actualizar histórico (recorte a 60 días)
+    # 8) Actualizar histórico (recorte a 60 días)
     today_ord = now_utc.date().toordinal()
     d_today = np.full((E_today.shape[0],), today_ord, dtype=np.int32)
     if E_hist is None or d_hist is None:
@@ -425,7 +416,7 @@ def main():
         E_new, d_new = E_new[keep], d_new[keep]
     save_history(E_new, d_new)
 
-    print(f"Informe generado. Clústeres: {len(clusters)} · Respaldo de piezas: {len(out_items) if not clusters else 0}")
+    print(f"Informe generado. Clústeres: {len(clusters)}")
 
 if __name__ == "__main__":
     main()
