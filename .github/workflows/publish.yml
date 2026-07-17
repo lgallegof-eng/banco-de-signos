@@ -76,6 +76,13 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./public
+          
+      - name: Run Banco de Signos
+        env:
+          PUBLISH_DIR: ${{ github.workspace }}/public
+          HIST_DIR: ${{ github.workspace }}/public/data
+          ALLOWED_SCRAPE_DOMAINS: "elperiodico.com,lavozdegalicia.es,smoda.elpais.com,codigonuevo.com,reasonwhy.es,controlpublicidad.com,elconfidencial.com,theatlantic.com,nytimes.com,fastcompany.com,highsnobiety.com,ft.com,businessinsider.com,businessinsider.es,bloomberg.com,theguardian.com"
+        run: python ci_pipeline.py
 
   deploy:
     needs: build
