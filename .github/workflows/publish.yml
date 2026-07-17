@@ -1,0 +1,87 @@
+name: Banco de Signos Daily
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC diario (ajusta si quieres)
+  workflow_dispatch: {}    # Permite ejecutarlo a mano
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+env:
+  SENTENCE_TRANSFORMERS_HOME: ${{ runner.temp }}/sbert
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-v1
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Cache Sentence-Transformers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SENTENCE_TRANSFORMERS_HOME }}
+          key: sbert-${{ runner.os }}-distiluse-base-multilingual-v1
+
+      - name: Restore history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: public/data
+          key: history-${{ runner.os }}
+          restore-keys: |
+            history-${{ runner.os }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser numpy sentence-transformers
+
+      - name: Run Banco de Signos
+        env:
+          PUBLISH_DIR: ${{ github.workspace }}/public
+          HIST_DIR: ${{ github.workspace }}/public/data
+        run: python ci_pipeline.py
+
+      - name: Save history cache
+        uses: actions/cache/save@v4
+        with:
+          path: public/data
+          key: history-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
