@@ -10,25 +10,230 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 # ------------ Configuración ------------
-FEEDS = [
-    # ——— España ———
-    "https://www.elperiodico.com/es/rss/rss_portada.xml",
-    "https://www.lavozdegalicia.es/rss/index.xml",
-    "https://smoda.elpais.com/feed/",
-    "https://www.codigonuevo.com/feed",
-    "https://www.reasonwhy.es/rss",
-    "https://controlpublicidad.com/feed/",
-    "https://www.elconfidencial.com/rss/ultimas_noticias/",
-    # ——— Internacional ———
-    "https://www.theatlantic.com/feed/all/",
-    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-    "https://www.fastcompany.com/rss",
-    "https://www.highsnobiety.com/feed/",
-    "https://www.ft.com/rss/home",
-    "https://www.businessinsider.com/rss",
-    "https://www.businessinsider.es/rss",
-    "https://feeds.bloomberg.com/markets/news.rss",
+# --------- FUENTES (por dominio) ---------
+SOURCES = [
+    # nombre, home, rss (lista, puede estar vacía), sitemaps opcionales
+    {"name":"El Periódico","home":"https://www.elperiodico.com/es/","rss":["https://www.elperiodico.com/es/rss/rss_portada.xml"],"sitemaps":["https://www.elperiodico.com/es/sitemap.xml"]},
+    {"name":"La Voz de Galicia","home":"https://www.lavozdegalicia.es/","rss":["https://www.lavozdegalicia.es/rss/index.xml"],"sitemaps":["https://www.lavozdegalicia.es/sitemap.xml"]},
+    {"name":"SModa","home":"https://smoda.elpais.com/","rss":["https://smoda.elpais.com/feed/"],"sitemaps":["https://smoda.elpais.com/sitemap.xml"]},
+    {"name":"Código Nuevo","home":"https://www.codigonuevo.com/","rss":["https://www.codigonuevo.com/feed"],"sitemaps":["https://www.codigonuevo.com/sitemap.xml"]},
+    {"name":"Reason Why","home":"https://www.reasonwhy.es/","rss":["https://www.reasonwhy.es/rss","https://www.reasonwhy.es/rss.xml"],"sitemaps":["https://www.reasonwhy.es/sitemap.xml"]},
+    {"name":"Control Publicidad","home":"https://controlpublicidad.com/","rss":["https://controlpublicidad.com/feed/"],"sitemaps":["https://controlpublicidad.com/sitemap.xml"]},
+    {"name":"El Confidencial","home":"https://www.elconfidencial.com/","rss":["https://www.elconfidencial.com/rss/ultimas_noticias/"],"sitemaps":["https://www.elconfidencial.com/sitemap.xml"]},
+    {"name":"The Atlantic","home":"https://www.theatlantic.com/","rss":["https://www.theatlantic.com/feed/all/"],"sitemaps":["https://www.theatlantic.com/sitemap.xml"]},
+    {"name":"The New York Times","home":"https://www.nytimes.com/","rss":[
+        "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml"
+    ],"sitemaps":["https://www.nytimes.com/sitemaps/news.xml"]},
+    {"name":"Fast Company","home":"https://www.fastcompany.com/","rss":["https://www.fastcompany.com/rss"],"sitemaps":["https://www.fastcompany.com/sitemap.xml"]},
+    {"name":"Highsnobiety","home":"https://www.highsnobiety.com/","rss":["https://www.highsnobiety.com/feed/"],"sitemaps":["https://www.highsnobiety.com/sitemap.xml"]},
+    {"name":"Financial Times","home":"https://www.ft.com/","rss":["https://www.ft.com/rss/home"],"sitemaps":["https://www.ft.com/sitemap_index.xml"]},
+    {"name":"Business Insider","home":"https://www.businessinsider.com/","rss":["https://www.businessinsider.com/rss"],"sitemaps":["https://www.businessinsider.com/sitemap.xml"]},
+    {"name":"Business Insider ES","home":"https://www.businessinsider.es/","rss":["https://www.businessinsider.es/rss"],"sitemaps":["https://www.businessinsider.es/sitemap.xml"]},
+    {"name":"Bloomberg","home":"https://www.bloomberg.com/","rss":[
+        "https://feeds.bloomberg.com/markets/news.rss",
+        "https://feeds.bloomberg.com/technology/news.rss"
+    ],"sitemaps":["https://www.bloomberg.com/sitemaps/sitemap_news.xml"]},
+    {"name":"The Guardian","home":"https://www.theguardian.com/international","rss":[
+        "https://www.theguardian.com/world/rss",
+        "https://www.theguardian.com/technology/rss",
+        "https://www.theguardian.com/business/rss",
+        "https://www.theguardian.com/science/rss"
+    ],"sitemaps":["https://www.theguardian.com/sitemaps/news.xml"]},
+]
+
+# --------- INGESTA ROBUSTA (RSS → autodiscovery → sitemaps → fallback título/desc) ---------
+import requests
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
+
+UA = "Mozilla/5.0 (compatible; BancoDeSignos/1.0; +https://github.com/lgallegof-eng/banco-de-signos)"
+REQ_TIMEOUT = 18
+MAX_AGE_DAYS = 14  # usa el valor que tengas configurado en tu script
+MAX_SITEMAP_LINKS = 200     # tope global desde sitemaps
+MAX_HTML_FETCH = 60         # tope global de páginas para titulo/description
+ALLOWED_SCRAPE = set([d.strip().lower() for d in os.getenv("ALLOWED_SCRAPE_DOMAINS","").split(",") if d.strip()])
+
+def http_get(url):
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=REQ_TIMEOUT, allow_redirects=True)
+        if r.status_code == 200 and r.content:
+            return r
+    except Exception:
+        return None
+    return None
+
+def autodiscover_feeds(home_url):
+    r = http_get(home_url)
+    urls = []
+    if not r: return urls
+    soup = BeautifulSoup(r.text, "lxml")
+    for link in soup.find_all("link", rel=lambda x: x and "alternate" in x):
+        t = (link.get("type") or "").lower()
+        if "rss" in t or "atom" in t or "xml" in t:
+            href = link.get("href")
+            if href:
+                urls.append(urljoin(home_url, href))
+    return list(dict.fromkeys(urls))
+
+def parse_feed(url):
+    d = feedparser.parse(url, request_headers={"User-Agent": UA})
+    items = []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=MAX_AGE_DAYS)
+    for e in d.entries:
+        link = (e.get("link") or "").split("?")[0]
+        if not link: continue
+        # fecha
+        dpub = None
+        for k in ("published_parsed","updated_parsed"):
+            t = e.get(k)
+            if t:
+                try:
+                    dpub = dt.datetime.fromtimestamp(time.mktime(t), tz=dt.timezone.utc)
+                    break
+                except Exception:
+                    pass
+        if not dpub:
+            for k in ("published","updated"):
+                s = e.get(k)
+                if s:
+                    try:
+                        dd = parsedate_to_datetime(s)
+                        dpub = dd if dd.tzinfo else dd.replace(tzinfo=dt.timezone.utc)
+                        break
+                    except Exception:
+                        pass
+        if not dpub: dpub = dt.datetime.now(dt.timezone.utc)  # fallback
+        if dpub < cutoff: continue
+        items.append({
+            "url": link,
+            "title": (e.get("title","") or "").strip() or "(Sin título)",
+            "summary": (e.get("summary","") or "").strip(),
+            "published_dt": dpub,
+        })
+    return items
+
+def parse_sitemap(url):
+    r = http_get(url)
+    if not r: return []
+    try:
+        soup = BeautifulSoup(r.content, "xml")
+    except Exception:
+        return []
+    out = []
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    cutoff = now_utc - dt.timedelta(days=MAX_AGE_DAYS)
+
+    # sitemapindex → recorrer sub-sitemaps (prioriza news)
+    idx = soup.find_all("sitemap")
+    if idx:
+        # prioriza sitemaps con "news" o los más recientes
+        def score(sm):
+            loc = (sm.find("loc").get_text() if sm.find("loc") else "").lower()
+            lastmod = sm.find("lastmod").get_text() if sm.find("lastmod") else ""
+            ts = 0
+            try:
+                ts = parsedate_to_datetime(lastmod).timestamp()
+            except Exception:
+                pass
+            return (("news" in loc) or ("latest" in loc), ts)
+        subs = sorted(idx, key=score, reverse=True)
+        urls = [sm.find("loc").get_text() for sm in subs if sm.find("loc")]
+        collected = []
+        for su in urls[:10]:  # limita sub-sitemaps
+            collected += parse_sitemap(su)
+            if len(collected) >= MAX_SITEMAP_LINKS:
+                break
+        return collected[:MAX_SITEMAP_LINKS]
+
+    # urlset → URLs
+    for u in soup.find_all("url"):
+        loc = u.find("loc").get_text() if u.find("loc") else None
+        if not loc: continue
+        last = u.find("lastmod").get_text() if u.find("lastmod") else None
+        dpub = None
+        if last:
+            try:
+                dd = parsedate_to_datetime(last)
+                dpub = dd if dd.tzinfo else dd.replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                pass
+        if not dpub:
+            dpub = now_utc
+        if dpub < cutoff: continue
+        out.append({"url": loc, "published_dt": dpub})
+    return out
+
+def fetch_title_desc(url):
+    # Solo si el dominio está permitido
+    dom = urlparse(url).netloc.lower()
+    dom = dom[4:] if dom.startswith("www.") else dom
+    if dom not in ALLOWED_SCRAPE:
+        return None, None
+    r = http_get(url)
+    if not r: return None, None
+    soup = BeautifulSoup(r.text, "lxml")
+    title = (soup.title.string.strip() if soup.title and soup.title.string else None)
+    desc = None
+    m = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", attrs={"property":"og:description"})
+    if m and m.get("content"): desc = m.get("content").strip()
+    return title, desc
+
+def ingest_sources(sources, now_utc):
+    seen = set()
+    items = []
+    html_fetches = 0
+    for s in sources:
+        # 1) RSS explícitos
+        for ru in (s.get("rss") or []):
+            try:
+                for it in parse_feed(ru):
+                    u = it["url"]
+                    if u in seen: continue
+                    seen.add(u)
+                    it["source"] = s["name"]
+                    items.append(it)
+            except Exception:
+                continue
+        # 2) Autodiscovery desde home
+        try:
+            for fu in autodiscover_feeds(s["home"]):
+                for it in parse_feed(fu):
+                    u = it["url"]
+                    if u in seen: continue
+                    seen.add(u); it["source"] = s["name"]; items.append(it)
+        except Exception:
+            pass
+        # 3) Sitemaps (como feed de respaldo)
+        for su in (s.get("sitemaps") or []):
+            try:
+                sm_items = parse_sitemap(su)
+            except Exception:
+                sm_items = []
+            for si in sm_items:
+                u = si["url"]
+                if u in seen: continue
+                # Fallback título/description muy limitado
+                title, desc = (None, None)
+                if html_fetches < MAX_HTML_FETCH:
+                    t, d = fetch_title_desc(u)
+                    if t: title = t
+                    if d: desc = d
+                    html_fetches += 1 if (t or d) else 0
+                items.append({
+                    "source": s["name"],
+                    "url": u,
+                    "title": title or "(Sin título)",
+                    "summary": desc or "",
+                    "published_dt": si["published_dt"],
+                })
+                seen.add(u)
+    # Orden por fecha
+    items.sort(key=lambda r: r["published_dt"], reverse=True)
+    return items
+
 ]
 
 # Señales
