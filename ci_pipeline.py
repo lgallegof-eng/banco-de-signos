@@ -1,8 +1,10 @@
 # ci_pipeline.py
-# Banco de Signos: lee RSS, filtra por recencia, calcula novedad y publica informe HTML.
-import os, time, math, datetime as dt
+# Banco de Signos — Señales débiles: recencia + novedad + micro-clústeres + marcos + opinión
+import os, time, math, datetime as dt, re
 from pathlib import Path
 from email.utils import parsedate_to_datetime
+from collections import Counter, deque, defaultdict
+
 import feedparser
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -27,14 +29,17 @@ FEEDS = [
     "https://www.businessinsider.com/rss",
     "https://www.businessinsider.es/rss",
     "https://feeds.bloomberg.com/markets/news.rss",
-    # Puedes añadir más aquí
+    # puedes añadir más
 ]
 
-TOP_K = 25                 # cuántas piezas mostrar
-MAX_PER_SOURCE = 4         # tope por cabecera para diversidad
-HISTORY_DAYS = 21          # ventana de histórico para calcular novedad
-MAX_AGE_DAYS = 3           # filtrar artículos más antiguos que X días
-RECENCY_TAU_HOURS = 72     # “semivida” de recencia (a menor, más peso a lo reciente)
+TOP_K_ITEMS = 25            # listado de respaldo (si faltan clústeres)
+HISTORY_DAYS = 21           # ventana histórico para novedad
+MAX_AGE_DAYS = 5            # recencia: últimos 5 días
+RECENCY_TAU_HOURS = 96      # semivida recencia
+SIM_THRESHOLD = 0.72        # umbral similitud para micro-clústeres
+CLUSTER_MIN = 2             # tamaño mínimo de clúster
+CLUSTER_MAX = 8             # tamaño máximo de clúster (señales débiles suelen ser micro)
+MAX_PER_SOURCE = 4          # límite por cabecera (variedad)
 
 # Directorios controlados por el workflow
 PUBLISH_DIR = Path(os.getenv("PUBLISH_DIR", "public")).resolve()
@@ -45,9 +50,67 @@ HIST_DIR.mkdir(parents=True, exist_ok=True)
 HIST_FILE = HIST_DIR / "history.npz"
 MODEL_NAME = "sentence-transformers/distiluse-base-multilingual-cased-v2"
 
+# ------------ Diccionarios de marcos (ES/EN) ------------
+FRAMES = {
+    "economía": [
+        "precio", "precios", "inflación", "coste", "costes", "empleo", "desempleo",
+        "recuperación", "salario", "PIB", "mercado", "inversión", "profits", "growth",
+        "inflation", "cost", "costs", "jobs", "recession", "recovery", "gdp", "market",
+        "investment", "funding", "valuation", "earnings"
+    ],
+    "salud": [
+        "salud", "sanitario", "sanitaria", "epidemia", "pandemia", "hospital", "OMS",
+        "mental", "bienestar", "contagio", "vacuna", "vaccine", "health", "public health",
+        "hospital", "wellbeing", "mental health"
+    ],
+    "sostenibilidad": [
+        "clima", "climático", "emisiones", "CO2", "energía", "renovable", "circular",
+        "sostenible", "biodiversidad", "green", "sustainable", "renewable", "emissions",
+        "net zero", "climate", "carbon"
+    ],
+    "privacidad/tech": [
+        "privacidad", "datos", "algoritmo", "IA", "inteligencia artificial", "modelo",
+        "plataforma", "red social", "app", "tracking", "cookies", "privacy", "data",
+        "algorithm", "ai", "platform", "tracking", "surveillance", "biometrics"
+    ],
+    "justicia_social": [
+        "género", "igualdad", "diversidad", "inclusión", "derechos", "discriminación",
+        "racismo", "LGTBI", "feminismo", "equity", "diversity", "inclusion", "rights",
+        "discrimination", "racism", "gender"
+    ],
+    "geopolítica": [
+        "guerra", "conflicto", "frontera", "sanciones", "OTAN", "UE", "china", "rusia",
+        "eeuu", "diplomacia", "war", "conflict", "border", "sanctions", "nato", "eu",
+        "china", "russia", "us", "geopolitics"
+    ],
+    "consumo/estilo": [
+        "consumo", "tendencia", "moda", "lifestyle", "estilo", "consumidor", "compra",
+        "retail", "cultura", "estética", "trend", "style", "fashion", "consumer",
+        "shopping", "culture"
+    ],
+}
+
+OPINION_HINTS = [
+    "opinión", "opinion", "análisis", "analysis", "editorial", "tribuna",
+    "columna", "column", "op-ed", "view", "viewpoint", "perspective"
+]
+
+STOPWORDS = set("""
+a al algo algunas algunos ante antes así aún aunque cada como con contra cual cuales cuando
+de del desde donde dos el la los las en entre era eran es esa esas ese eso esos esta estaban
+estamos estar esta esta estas este esto estos estuvo ha había habían haber hacia hace hacen
+hacer hacen haciendo han hasta hay he hemos hizo más mejor menos mi mis muy nada ni no nos
+nuestra nuestras nuestro nuestros nunca o otras otros para pero poco por porque qué que quien
+se será ser si sido sin sobre son su sus tal también tampoco tan tanto te tener tiene tienen
+toda todas todo todos tras tú un una unas uno unos ya the a an and or of for to from in on by
+is are was were be been being have has had do does did with as at into over after before about
+between more most other some such no nor not only own same so than too very can will just should
+""".split())
+
+TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ0-9]+")
+
 # ------------ Utilidades ------------
 def parse_entry_dt(entry):
-    # Intenta varios campos de fecha del feed
     for k in ("published_parsed", "updated_parsed"):
         t = entry.get(k)
         if t:
@@ -65,6 +128,33 @@ def parse_entry_dt(entry):
                 pass
     return None
 
+def is_opinion(title, summary):
+    t = (title or "").lower()
+    s = (summary or "").lower()
+    return any(h in t or h in s for h in OPINION_HINTS)
+
+def frame_profile(text):
+    txt = (text or "").lower()
+    scores = {}
+    for f, kws in FRAMES.items():
+        c = sum(1 for kw in kws if kw in txt)
+        scores[f] = c
+    # normaliza
+    total = sum(scores.values()) or 1
+    for k in scores:
+        scores[k] = scores[k] / total
+    top = max(scores, key=scores.get) if scores else None
+    return top, scores
+
+def tokenize(text):
+    return [w.lower() for w in TOKEN_RE.findall(text or "") if w and w.lower() not in STOPWORDS and len(w) >= 4]
+
+def top_terms(texts, k=5):
+    c = Counter()
+    for t in texts:
+        c.update(tokenize(t))
+    return [w for w,_ in c.most_common(k)]
+
 def fetch_items(feeds, now_utc):
     items, seen = [], set()
     cutoff = now_utc - dt.timedelta(days=MAX_AGE_DAYS)
@@ -80,11 +170,7 @@ def fetch_items(feeds, now_utc):
                 continue
             seen.add(link)
             dpub = parse_entry_dt(e)
-            if not dpub:
-                # si no hay fecha fiable, salta la pieza
-                continue
-            # filtra por recencia
-            if dpub < cutoff:
+            if not dpub or dpub < cutoff:
                 continue
             title = (e.get("title", "") or "").strip() or "(Sin título)"
             summary = (e.get("summary", "") or "").strip()
@@ -93,10 +179,8 @@ def fetch_items(feeds, now_utc):
                 "title": title,
                 "url": link,
                 "summary": summary,
-                "published_iso": dpub.astimezone(dt.timezone.utc).isoformat(timespec="minutes"),
-                "published_dt": dpub,
+                "published_dt": dpub.astimezone(dt.timezone.utc),
             })
-    # orden preliminar por fecha (más reciente primero)
     items.sort(key=lambda r: r["published_dt"], reverse=True)
     return items
 
@@ -109,7 +193,72 @@ def load_history():
 def save_history(E_hist, d_hist):
     np.savez_compressed(HIST_FILE, E=E_hist, d=d_hist)
 
-def build_html(today, ranked):
+def build_clusters(E, items, novelty):
+    # E: (n,d) normalizado. Construye grafo por umbral y extrae componentes
+    n = E.shape[0]
+    S = E @ E.T
+    np.fill_diagonal(S, 0.0)
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        # umbral de similitud
+        js = np.where(S[i] >= SIM_THRESHOLD)[0]
+        for j in js:
+            adj[i].append(j)
+            adj[j].append(i)
+    visited = [False]*n
+    clusters = []
+    for i in range(n):
+        if visited[i]: continue
+        comp = []
+        q = deque([i]); visited[i] = True
+        while q:
+            u = q.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    q.append(v)
+        if CLUSTER_MIN <= len(comp) <= CLUSTER_MAX:
+            clusters.append(sorted(comp))
+    # Calcula métricas y etiquetas por clúster
+    results = []
+    for comp in clusters:
+        comp_items = [items[i] for i in comp]
+        comp_nov = float(np.mean([novelty[i] for i in comp]))
+        sources = [it["source"] for it in comp_items]
+        uniq_sources = len(set(sources))
+        diversity = uniq_sources / max(1, len(comp))
+        opinions = any(is_opinion(it["title"], it["summary"]) for it in comp_items)
+        opinion_bonus = 0.15 if opinions else 0.0
+        # marcos
+        frame_counts = Counter()
+        for it in comp_items:
+            topf, _ = frame_profile((it["title"] + " " + it["summary"]))
+            if topf: frame_counts[topf] += 1
+        top_frame, top_frame_cnt = (frame_counts.most_common(1)[0] if frame_counts else (None, 0))
+        # términos
+        terms = top_terms([it["title"] + " " + it["summary"] for it in comp_items], k=5)
+        # puntuación compuesta (0..1)
+        # pequeña preferencia por microtamaño (2-6)
+        size = len(comp)
+        size_pref = 1.0 if size <= 6 else 0.8
+        score = 0.5*comp_nov + 0.3*diversity + 0.2*size_pref + opinion_bonus
+        results.append({
+            "idxs": comp,
+            "size": size,
+            "avg_novelty": round(comp_nov, 3),
+            "diversity": round(diversity, 3),
+            "opinion": opinions,
+            "top_frame": top_frame,
+            "terms": terms,
+            "score": round(min(score, 1.0), 3),
+            "sources": sorted(set(sources)),
+            "items": comp_items,
+        })
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+def build_html(today, clusters, picked_items):
     fn = PUBLISH_DIR / f"weak_signals_{today}.html"
     parts = []
     parts += [
@@ -123,29 +272,56 @@ def build_html(today, ranked):
         ".hi{background:#0b8457}.med{background:#f1a208}.lo{background:#888}",
         "a{color:#0a58ca;text-decoration:none} a:hover{text-decoration:underline}",
         ".meta{font-size:12px;color:#555;margin-top:6px}",
+        "ul{margin:6px 0 0 18px}",
         "</style></head><body>",
-        f"<h1>Banco de Signos — Informe de los últimos {MAX_AGE_DAYS} días</h1>",
-        "<p>Prioriza piezas recientes y con alta novedad semántica frente al histórico.</p>",
+        f"<h1>Banco de Signos — Señales débiles (últimos {MAX_AGE_DAYS} días)</h1>",
+        "<p>Prioriza micro‑clústeres recientes con alta novedad, diversidad de fuentes, opinión/análisis y marcos poco frecuentes.</p>",
     ]
-    for r in ranked:
-        n = r["novelty"]
-        age_h = r["age_hours"]
-        score = r["score"]
-        cls = "hi" if score >= 0.6 else ("med" if score >= 0.35 else "lo")
-        parts.append("<div class='card'>")
-        parts.append(
-            f"<h3><a href='{r['url']}' target='_blank' rel='noopener'>{r['title']}</a> "
-            f"<span class='badge {cls}' title='score (novedad x recencia)'>{score:.2f}</span></h3>"
-        )
-        if r.get("summary"):
-            short = r["summary"]
-            short = (short[:320] + "…") if len(short) > 340 else short
-            parts.append(f"<p>{short}</p>")
-        meta = f"{r['source']} · {r.get('published_iso','')} · novedad {n:.2f} · hace {age_h:.0f}h"
-        parts.append(f"<div class='meta'>{meta}</div>")
-        parts.append("</div>")
-    parts.append("<hr><small>RSS públicos (titulares y resúmenes). Solo artículos de los últimos "
-                 f"{MAX_AGE_DAYS} días. Score = novedad × factor de recencia.</small>")
+    # Sección de clústeres
+    if clusters:
+        for c in clusters:
+            cls = "hi" if c["score"] >= 0.6 else ("med" if c["score"] >= 0.4 else "lo")
+            title = " / ".join(c["terms"]) if c["terms"] else "Micro‑tema"
+            parts.append("<div class='card'>")
+            parts.append(f"<h2>{title} <span class='badge {cls}' title='score'>{c['score']:.2f}</span></h2>")
+            bullets = []
+            bullets.append(f"Tamaño: {c['size']} · Fuentes: {len(c['sources'])} ({', '.join(c['sources'][:5])})")
+            bullets.append(f"Novedad media: {c['avg_novelty']:.2f} · Diversidad: {c['diversity']:.2f}")
+            if c["top_frame"]:
+                bullets.append(f"Marco dominante: {c['top_frame']}")
+            if c["opinion"]:
+                bullets.append("Incluye opinión/análisis")
+            parts.append("<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>")
+            # muestras
+            for it in c["items"]:
+                meta = f"{it['source']} · {it['published_dt'].isoformat(timespec='minutes')}"
+                parts.append(f"<p><a href='{it['url']}' target='_blank' rel='noopener'>{it['title']}</a><br><span class='meta'>{meta}</span></p>")
+            parts.append("</div>")
+    else:
+        parts.append("<p>No se han detectado micro‑clústeres hoy. Mostramos piezas destacadas por novedad+recencia.</p>")
+
+    # Respaldo: piezas individuales si faltan clústeres
+    if picked_items:
+        parts.append("<h2>Piezas destacadas (novedad × recencia)</h2>")
+        for r in picked_items:
+            score = r["score"]
+            cls = "hi" if score >= 0.6 else ("med" if score >= 0.4 else "lo")
+            parts.append("<div class='card'>")
+            parts.append(f"<h3><a href='{r['url']}' target='_blank' rel='noopener'>{r['title']}</a> "
+                         f"<span class='badge {cls}'>{score:.2f}</span></h3>")
+            if r.get("summary"):
+                short = r["summary"]; short = (short[:320] + "…") if len(short) > 340 else short
+                parts.append(f"<p>{short}</p>")
+            meta = f"{r['source']} · {r.get('published_iso','')} · novedad {r['novelty']:.2f} · hace {r['age_hours']:.0f}h"
+            if r.get("top_frame"):
+                meta += f" · marco: {r['top_frame']}"
+            if r.get("opinion"):
+                meta += " · opinión/análisis"
+            parts.append(f"<div class='meta'>{meta}</div>")
+            parts.append("</div>")
+
+    parts.append("<hr><small>RSS públicos. Score de clúster = novedad×diversidad×tamaño (micro) + bonus opinión. "
+                 "Los marcos se estiman con diccionarios ES/EN.</small>")
     parts.append("</body></html>")
     fn.write_text("\n".join(parts), encoding="utf-8")
     return fn.name
@@ -174,10 +350,10 @@ def main():
     today_iso = now_utc.date().isoformat()
 
     items = fetch_items(FEEDS, now_utc)
-    # Siempre crea índice (evita 404) aunque no haya items
+    # Genera siempre índice (evita 404)
     if not items:
         build_index()
-        print("Sin artículos recientes en las fuentes configuradas.")
+        print("Sin artículos recientes.")
         return
 
     # Texto para embeddings
@@ -188,7 +364,7 @@ def main():
     E_today = model.encode(texts, batch_size=16, normalize_embeddings=True)
     E_today = np.asarray(E_today).astype(np.float32)
 
-    # Cargar histórico (ventana)
+    # Cargar histórico y recortar ventana
     E_hist, d_hist = load_history()
     cutoff = (now_utc.date() - dt.timedelta(days=HISTORY_DAYS)).toordinal()
     if E_hist is not None and d_hist is not None:
@@ -199,35 +375,42 @@ def main():
     if E_hist is None or E_hist.shape[0] == 0:
         novelty = np.ones(E_today.shape[0], dtype=np.float32)
     else:
-        sims = E_today @ E_hist.T  # embeddings normalizados
+        sims = E_today @ E_hist.T
         novelty = 1.0 - np.max(sims, axis=1)
 
-    # Recencia y score combinado
-    ranked = []
+    # Recencia y score individual (respaldo)
+    picked = []
     for i, it in enumerate(items):
         age_h = max(0.0, (now_utc - it["published_dt"]).total_seconds() / 3600.0)
         recency_w = math.exp(-age_h / float(RECENCY_TAU_HOURS))
         score = float(novelty[i]) * recency_w
-        ranked.append({
+        topf, _ = frame_profile((it["title"] + " " + it["summary"]))
+        picked.append({
             **it,
+            "published_iso": it["published_dt"].isoformat(timespec="minutes"),
             "novelty": float(novelty[i]),
             "age_hours": age_h,
             "score": score,
+            "top_frame": topf,
+            "opinion": is_opinion(it["title"], it["summary"]),
+            "url": it["url"],
         })
-
-    # Diversidad por fuente y TOP_K
-    ranked.sort(key=lambda r: r["score"], reverse=True)
-    picked, per_source = [], {}
-    for r in ranked:
+    # limitar por fuente para variedad
+    picked.sort(key=lambda r: r["score"], reverse=True)
+    out_items, seen_per_source = [], {}
+    for r in picked:
         s = r["source"]
-        if per_source.get(s, 0) < MAX_PER_SOURCE:
-            picked.append(r)
-            per_source[s] = per_source.get(s, 0) + 1
-        if len(picked) >= TOP_K:
+        if seen_per_source.get(s, 0) < MAX_PER_SOURCE:
+            out_items.append(r)
+            seen_per_source[s] = seen_per_source.get(s, 0) + 1
+        if len(out_items) >= TOP_K_ITEMS:
             break
 
+    # Micro‑clústeres
+    clusters = build_clusters(E_today, items, novelty)
+
     # Generar salida
-    build_html(today_iso, picked)
+    build_html(today_iso, clusters, out_items if not clusters else [])
     build_index()
 
     # Actualizar histórico (recorte a 60 días)
@@ -242,7 +425,7 @@ def main():
         E_new, d_new = E_new[keep], d_new[keep]
     save_history(E_new, d_new)
 
-    print(f"Informe generado con {len(picked)} piezas recientes.")
+    print(f"Informe generado. Clústeres: {len(clusters)} · Respaldo de piezas: {len(out_items) if not clusters else 0}")
 
 if __name__ == "__main__":
     main()
