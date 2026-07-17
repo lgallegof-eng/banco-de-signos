@@ -3,7 +3,7 @@ name: Banco de Signos Daily
 on:
   schedule:
     - cron: "0 6 * * *"   # 06:00 UTC diario (ajusta si quieres)
-  workflow_dispatch: {}    # Permite ejecutarlo a mano
+  workflow_dispatch: {}    # Ejecutar manualmente
 
 permissions:
   contents: read
@@ -13,9 +13,6 @@ permissions:
 concurrency:
   group: "pages"
   cancel-in-progress: true
-
-env:
-  SENTENCE_TRANSFORMERS_HOME: ${{ runner.temp }}/sbert
 
 jobs:
   build:
@@ -29,6 +26,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Define el HOME del modelo en una ruta temporal del runner
+      - name: Set Sentence-Transformers cache home
+        run: echo "SENTENCE_TRANSFORMERS_HOME=$RUNNER_TEMP/sbert" >> $GITHUB_ENV
+
+      # (Opcional) Cache pip para acelerar instalaciones
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -37,12 +39,14 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
+      # Cache del modelo (usa la variable que acabamos de definir)
       - name: Cache Sentence-Transformers
         uses: actions/cache@v4
         with:
           path: ${{ env.SENTENCE_TRANSFORMERS_HOME }}
           key: sbert-${{ runner.os }}-distiluse-base-multilingual-v1
 
+      # Persistimos histórico entre ejecuciones
       - name: Restore history cache
         uses: actions/cache/restore@v4
         with:
