@@ -8,17 +8,39 @@ from sentence_transformers import SentenceTransformer
 
 # -------- Fuentes (puedes ajustar) --------
 FEEDS = [
-    # España
-    "https://elpais.com/rss/elpais/portada.xml",
-    "https://www.elmundo.es/rss/portada.xml",
-    "https://www.eldiario.es/rss/",
-    "https://www.abc.es/rss/feeds/abc_ultima.xml",
-    "https://www.lavanguardia.com/mvc/feed/rss/home",
+    # ——— España ———
+    # El Periódico (portada)
+    "https://www.elperiodico.com/es/rss/rss_portada.xml",
+    # La Voz de Galicia (portada)
+    "https://www.lavozdegalicia.es/rss/index.xml",
+    # SModa (El País, WordPress)
+    "https://smoda.elpais.com/feed/",
+    # Código Nuevo (WordPress)
+    "https://www.codigonuevo.com/feed",
+    # Reason Why (marketing)
+    "https://www.reasonwhy.es/rss",
+    # Control Publicidad (WordPress)
+    "https://controlpublicidad.com/feed/",
+    # El Confidencial (últimas noticias)
     "https://www.elconfidencial.com/rss/ultimas_noticias/",
-    "https://www.20minutos.es/rss/",
-    # Internacional
-    "https://www.theguardian.com/international/rss",
-    "https://www.bbc.co.uk/feeds/rss/world.xml",
+
+    # ——— Internacional ———
+    # The Atlantic (todos los artículos)
+    "https://www.theatlantic.com/feed/all/",
+    # The New York Times (Home y Mundo)
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    # Fast Company (general)
+    "https://www.fastcompany.com/rss",
+    # Highsnobiety (WordPress)
+    "https://www.highsnobiety.com/feed/",
+    # Financial Times (Home)
+    "https://www.ft.com/rss/home",
+    # Business Insider (Global y España)
+    "https://www.businessinsider.com/rss",
+    "https://www.businessinsider.es/rss",
+    # Bloomberg (a validar; Bloomberg cambia a menudo sus RSS)
+    "https://feeds.bloomberg.com/markets/news.rss",
 ]
 
 TOP_K = 20
