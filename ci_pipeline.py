@@ -1,5 +1,5 @@
 # ci_pipeline.py
-# Banco de Signos — ingesta robusta (RSS + autodiscovery + sitemaps + fallback) y objetivo 40–50 señales/día.
+# Banco de Signos — ingesta robusta con límites (anti-bloqueo) + objetivo 40–50 señales/día
 import os, time, math, datetime as dt, re
 from pathlib import Path
 from email.utils import parsedate_to_datetime
@@ -9,17 +9,24 @@ import feedparser
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-# ------------ Volumen/ventanas/umbrales ------------
-TARGET_MIN = 40         # objetivo mínimo de piezas publicadas
-TARGET_MAX = 50         # objetivo máximo de piezas publicadas
+# ------------ Objetivo/ventanas/umbrales ------------
+TARGET_MIN = 40
+TARGET_MAX = 50
 
-HISTORY_DAYS = 21       # histórico p/ novedad
-MAX_AGE_DAYS = 14       # analizamos últimos X días (más cobertura)
-RECENCY_TAU_HOURS = 144 # semivida recencia (penaliza menos el tiempo)
-SIM_THRESHOLD = 0.66    # similitud mínima para clúster (más laxo)
-CLUSTER_MIN = 2         # tamaño mínimo de micro‑clúster
-CLUSTER_MAX = 12        # tamaño máximo de micro‑clúster
-MAX_PER_SOURCE = 8      # límite global por fuente (clústeres + piezas)
+HISTORY_DAYS = 21
+MAX_AGE_DAYS = 12          # ventana suficiente (controlada)
+RECENCY_TAU_HOURS = 144
+SIM_THRESHOLD = 0.66
+CLUSTER_MIN = 2
+CLUSTER_MAX = 12
+MAX_PER_SOURCE = 8         # límite global (clústeres + singles)
+
+# ------------ Límites (anti-bloqueo) IMPORTANTES ------------
+PER_SOURCE_CAP = 100       # máx. piezas por marca (RSS+autodiscovery+sitemaps combinados)
+GLOBAL_CAP = 900           # máx. piezas totales antes de embeddings
+ENCODE_CAP = 800           # máx. piezas para calcular embeddings/cluster (O(n^2))
+TEXT_SUMMARY_LEN = 600     # recorte de texto por item para embeddings (reduce coste)
+BATCH_SIZE = 8             # batch de embeddings (reduce RAM)
 
 # ------------ Publicación/paths ------------
 PUBLISH_DIR = Path(os.getenv("PUBLISH_DIR", "public")).resolve()
@@ -31,7 +38,6 @@ HIST_FILE = HIST_DIR / "history.npz"
 MODEL_NAME = "sentence-transformers/distiluse-base-multilingual-cased-v2"
 
 # ------------ Fuentes por dominio ------------
-# Puedes añadir o editar sitemaps/RSS por marca. Se intentará: RSS → autodiscovery → sitemaps → fallback HTML (opcional).
 SOURCES = [
     {"name":"El Periódico","home":"https://www.elperiodico.com/es/","rss":["https://www.elperiodico.com/es/rss/rss_portada.xml"],"sitemaps":["https://www.elperiodico.com/es/sitemap.xml"]},
     {"name":"La Voz de Galicia","home":"https://www.lavozdegalicia.es/","rss":["https://www.lavozdegalicia.es/rss/index.xml"],"sitemaps":["https://www.lavozdegalicia.es/sitemap.xml"]},
@@ -63,13 +69,12 @@ SOURCES = [
         "https://feeds.bloomberg.com/technology/news.rss"
     ],"sitemaps":["https://www.bloomberg.com/sitemaps/sitemap_news.xml"]},
 
-    # Extra para volumen (opcional; puedes desactivar si no quieres)
     {"name":"Reuters","home":"https://www.reuters.com/","rss":["https://www.reuters.com/world/rss"],"sitemaps":["https://www.reuters.com/sitemap_index.xml"]},
     {"name":"The Verge","home":"https://www.theverge.com/","rss":["https://www.theverge.com/rss/index.xml"],"sitemaps":["https://www.theverge.com/sitemap.xml"]},
     {"name":"Wired","home":"https://www.wired.com/","rss":["https://www.wired.com/feed/rss"],"sitemaps":["https://www.wired.com/sitemap-index.xml"]},
 ]
 
-# ------------ Marcos/opinión (enriquecido pero ligero) ------------
+# ------------ Marcos/opinión ------------
 FRAMES = {
     "economía": ["precio","precios","inflación","coste","costes","empleo","desempleo","recuperación","salario","pib","mercado","inversión",
                  "profits","growth","inflation","cost","jobs","recession","recovery","gdp","market","investment","funding","valuation","earnings"],
@@ -101,15 +106,15 @@ between more most other some such no nor not only own same so than too very can 
 """.split())
 TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ0-9]+")
 
-# ------------ Ingesta robusta (RSS → autodiscovery → sitemaps → fallback HTML) ------------
+# ------------ Ingesta robusta con límites ------------
 import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 UA = "Mozilla/5.0 (compatible; BancoDeSignos/1.0; +https://github.com/lgallegof-eng/banco-de-signos)"
 REQ_TIMEOUT = 18
-MAX_SITEMAP_LINKS = 200  # tope global desde sitemaps
-MAX_HTML_FETCH = 60      # tope global de HTML fallback (título/description)
+MAX_SITEMAP_LINKS = 120   # baja un poco para evitar explosión
+MAX_HTML_FETCH = 30       # fallback HTML muy acotado
 ALLOWED_SCRAPE = set([d.strip().lower() for d in os.getenv("ALLOWED_SCRAPE_DOMAINS","").split(",") if d.strip()])
 
 def http_get(url):
@@ -138,7 +143,6 @@ def autodiscover_feeds(home_url):
     return list(dict.fromkeys(urls))
 
 def parse_entry_dt_feed(e):
-    # Intenta varios campos de fecha del feed
     for k in ("published_parsed","updated_parsed"):
         t = e.get(k)
         if t:
@@ -163,7 +167,7 @@ def parse_feed(url):
     for e in d.entries:
         link = (e.get("link") or "").split("?")[0]
         if not link: continue
-        dpub = parse_entry_dt_feed(e) or dt.datetime.now(dt.timezone.utc)  # fallback
+        dpub = parse_entry_dt_feed(e) or dt.datetime.now(dt.timezone.utc)
         if dpub < cutoff: continue
         items.append({
             "url": link,
@@ -186,7 +190,6 @@ def parse_sitemap(url):
 
     idx = soup.find_all("sitemap")
     if idx:
-        # prioriza sitemaps con "news"/"latest" y lastmod más reciente
         def score(sm):
             loc = (sm.find("loc").get_text() if sm.find("loc") else "").lower()
             lastmod = sm.find("lastmod").get_text() if sm.find("lastmod") else ""
@@ -199,7 +202,7 @@ def parse_sitemap(url):
         subs = sorted(idx, key=score, reverse=True)
         urls = [sm.find("loc").get_text() for sm in subs if sm.find("loc")]
         collected = []
-        for su in urls[:10]:
+        for su in urls[:8]:  # menos sub-sitemaps
             collected += parse_sitemap(su)
             if len(collected) >= MAX_SITEMAP_LINKS:
                 break
@@ -222,8 +225,6 @@ def parse_sitemap(url):
     return out
 
 def fetch_title_desc(url):
-    # Solo si el dominio está permitido
-    from urllib.parse import urlparse
     dom = urlparse(url).netloc.lower()
     dom = dom[4:] if dom.startswith("www.") else dom
     if dom not in ALLOWED_SCRAPE:
@@ -244,32 +245,43 @@ def ingest_sources(sources, now_utc):
     seen = set()
     items = []
     html_fetches = 0
+    per_source_counts = {}
+
     for s in sources:
-        # 1) RSS explícitos
+        sname = s["name"]
+        per_source_counts.setdefault(sname, 0)
+        # 1) RSS
         for ru in (s.get("rss") or []):
             try:
                 for it in parse_feed(ru):
+                    if per_source_counts[sname] >= PER_SOURCE_CAP: break
                     u = it["url"]
                     if u in seen: continue
-                    seen.add(u); it["source"] = s["name"]; items.append(it)
+                    seen.add(u); it["source"] = sname; items.append(it)
+                    per_source_counts[sname] += 1
             except Exception:
                 continue
-        # 2) Autodiscovery desde home
+        # 2) Autodiscovery
         try:
             for fu in autodiscover_feeds(s["home"]):
+                if per_source_counts[sname] >= PER_SOURCE_CAP: break
                 for it in parse_feed(fu):
+                    if per_source_counts[sname] >= PER_SOURCE_CAP: break
                     u = it["url"]
                     if u in seen: continue
-                    seen.add(u); it["source"] = s["name"]; items.append(it)
+                    seen.add(u); it["source"] = sname; items.append(it)
+                    per_source_counts[sname] += 1
         except Exception:
             pass
-        # 3) Sitemaps (respaldo)
+        # 3) Sitemaps
         for su in (s.get("sitemaps") or []):
+            if per_source_counts[sname] >= PER_SOURCE_CAP: break
             try:
                 sm_items = parse_sitemap(su)
             except Exception:
                 sm_items = []
             for si in sm_items:
+                if per_source_counts[sname] >= PER_SOURCE_CAP: break
                 u = si["url"]
                 if u in seen: continue
                 title, desc = (None, None)
@@ -279,21 +291,32 @@ def ingest_sources(sources, now_utc):
                     if d: desc = d
                     if t or d: html_fetches += 1
                 items.append({
-                    "source": s["name"],
+                    "source": sname,
                     "url": u,
                     "title": title or "(Sin título)",
                     "summary": desc or "",
                     "published_dt": si["published_dt"],
                 })
                 seen.add(u)
+                per_source_counts[sname] += 1
+
+        # Si ya superamos el tope global, paramos
+        if len(items) >= GLOBAL_CAP:
+            break
+
+    # Orden por fecha y recorte global
     items.sort(key=lambda r: r["published_dt"], reverse=True)
+    if len(items) > GLOBAL_CAP:
+        items = items[:GLOBAL_CAP]
     return items
 
 # ------------ Utilidades de análisis ------------
+FRAMES_KEYS = list(FRAMES.keys())
 def is_opinion(title, summary):
     t = (title or "").lower(); s = (summary or "").lower()
     return any(h in t or h in s for h in OPINION_HINTS)
 
+TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ0-9]+")
 def tokenize(text):
     return [w.lower() for w in TOKEN_RE.findall(text or "") if w and w.lower() not in STOPWORDS and len(w) >= 4]
 
@@ -414,8 +437,8 @@ def build_html(today, clusters, singles, total_count):
             parts.append(f"<div class='meta'>{meta}</div>")
             parts.append("</div>")
 
-    parts.append("<hr><small>RSS/Autodiscovery/Sitemaps. Clúster = novedad×diversidad×preferencia por micro; piezas = novedad×recencia. Ventana: "
-                 f"{MAX_AGE_DAYS} días.</small>")
+    parts.append("<hr><small>Capas de ingesta: RSS/Autodiscovery/Sitemaps (fallback HTML opcional). "
+                 f"Clúster = novedad×diversidad×preferencia por micro; piezas = novedad×recencia. Ventana: {MAX_AGE_DAYS} días.</small>")
     parts.append("</body></html>")
     fn.write_text("\n".join(parts), encoding="utf-8")
     return fn.name
@@ -443,17 +466,21 @@ def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
     today_iso = now_utc.date().isoformat()
 
-    # 1) Ingesta robusta
+    # 1) Ingesta
     items = ingest_sources(SOURCES, now_utc)
     if not items:
         build_index()
         print("Sin artículos recientes.")
         return
 
-    # 2) Embeddings (título + resumen)
-    texts = [(it["title"] + " || " + (it["summary"] or "")[:1000]).strip() for it in items]
+    # Recorte extra antes de embeddings (anti-oom)
+    if len(items) > ENCODE_CAP:
+        items = items[:ENCODE_CAP]
+
+    # 2) Embeddings (título + resumen recortado)
+    texts = [(it["title"] + " || " + (it["summary"] or "")[:TEXT_SUMMARY_LEN]).strip() for it in items]
     model = SentenceTransformer(MODEL_NAME)
-    E_today = model.encode(texts, batch_size=16, normalize_embeddings=True)
+    E_today = model.encode(texts, batch_size=BATCH_SIZE, normalize_embeddings=True)
     E_today = np.asarray(E_today).astype(np.float32)
 
     # 3) Novedad vs histórico
@@ -485,44 +512,39 @@ def main():
     # 5) Clústeres
     clusters = build_clusters(E_today, items, novelty)
 
-    # 6) Selección final (objetivo 40–50) sin duplicados y con límite por fuente global
+    # 6) Selección final a objetivo 40–50 (sin duplicados; límite por fuente)
     cluster_urls = set()
     source_counts = {}
     total_count = 0
     for c in clusters:
         for it in c["items"]:
             u = it["url"]
+            if u in cluster_urls: continue
             cluster_urls.add(u)
             source_counts[it["source"]] = source_counts.get(it["source"], 0) + 1
             total_count += 1
 
     singles = []
     for r in picked:
-        if r["url"] in cluster_urls:
-            continue
+        if r["url"] in cluster_urls: continue
         src = r["source"]
-        if source_counts.get(src, 0) >= MAX_PER_SOURCE:
-            continue
-        if total_count >= TARGET_MAX:
-            break
+        if source_counts.get(src, 0) >= MAX_PER_SOURCE: continue
+        if total_count >= TARGET_MAX: break
         singles.append(r)
         source_counts[src] = source_counts.get(src, 0) + 1
         total_count += 1
 
     if total_count < TARGET_MIN:
         for r in picked:
-            if r["url"] in cluster_urls or any(s["url"] == r["url"] for s in singles):
-                continue
-            if total_count >= TARGET_MIN:
-                break
-            singles.append(r)
-            total_count += 1
+            if r["url"] in cluster_urls or any(s["url"] == r["url"] for s in singles): continue
+            if total_count >= TARGET_MIN: break
+            singles.append(r); total_count += 1
 
     # 7) Publicación
     build_html(today_iso, clusters, singles, total_count)
     build_index()
 
-    # 8) Actualiza histórico (recorte a 60 días)
+    # 8) Histórico
     today_ord = now_utc.date().toordinal()
     d_today = np.full((E_today.shape[0],), today_ord, dtype=np.int32)
     if E_hist is None or d_hist is None:
@@ -531,7 +553,7 @@ def main():
         E_new = np.vstack([E_hist, E_today]); d_new = np.concatenate([d_hist, d_today])
         keep = d_new >= (now_utc.date() - dt.timedelta(days=60)).toordinal()
         E_new, d_new = E_new[keep], d_new[keep]
-    save_history(E_new, d_new)
+    np.savez_compressed(HIST_FILE, E=E_new, d=d_new)
 
     print(f"Publicado: {total_count} (clústeres: {sum(len(c['items']) for c in clusters)} · singles: {len(singles)})")
 
